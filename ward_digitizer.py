@@ -591,6 +591,91 @@ def _detect_blobs(img_bgr, rgb_colour, tol=30, max_aspect=None,
     return out, mask
 
 
+def detect_manholes_outlined(img_bgr, fill_colour=None, min_radius=None, max_radius=None,
+                             param2=26, interior_frac_thresh=0.06, tol=60):
+    """Detect manholes drawn as BLACK-OUTLINE CIRCLES with a coloured fill /
+    marks inside (Ward 52 style), rather than as solid coloured symbols.
+
+    Why a whole separate detector: on Ward 52 the manhole is a black ring
+    with a bright-green hatch (small circles) or green +/triangle/dot marks
+    (large labelled circles) inside it. The colour-blob detector latches
+    onto the *interior marks* and drops one point per mark -- so a big
+    circle with 5 marks became 5 points. Here we instead find the ring
+    itself with a Hough circle transform (one detection per circle,
+    whatever is inside), then keep only circles that actually contain the
+    fill colour -- which removes text loops ('O', 'D', 'RCPC') and other
+    round shapes that have nothing coloured inside.
+
+    fill_colour : (R,G,B) of the interior fill. If None, it's auto-detected
+        as the most common saturated colour found inside the candidate
+        circles -- so this is not hard-coded to green and adapts per sheet.
+    Radii and spacing default to a fraction of the sheet size, so the two
+    circle sizes on a sheet are both caught at any resolution.
+    """
+    from collections import Counter
+    from scipy.spatial import cKDTree
+
+    h, w = img_bgr.shape[:2]
+    scale = max(h, w) / 10000.0
+    if min_radius is None:
+        min_radius = max(5, int(round(9 * scale)))
+    if max_radius is None:
+        max_radius = max(min_radius + 6, int(round(45 * scale)))
+    min_dist = max(10, int(round(20 * scale)))
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    circles = cv2.HoughCircles(cv2.medianBlur(gray, 3), cv2.HOUGH_GRADIENT, dp=1,
+                               minDist=min_dist, param1=100, param2=param2,
+                               minRadius=min_radius, maxRadius=max_radius)
+    if circles is None:
+        return []
+    circles = np.round(circles[0]).astype(int)
+
+    def _interior(mask, x, y, rad, f=0.8):
+        r0 = max(2, int(rad * f))
+        y0, y1 = max(0, y - r0), min(mask.shape[0], y + r0)
+        x0, x1 = max(0, x - r0), min(mask.shape[1], x + r0)
+        p = mask[y0:y1, x0:x1]
+        return (p.mean() / 255) if p.size else 0.0
+
+    if fill_colour is None:  # auto-discover the interior fill colour
+        votes = Counter()
+        for x, y, rad in circles:
+            r0 = max(2, int(rad * 0.6))
+            y0, y1 = max(0, y - r0), min(h, y + r0)
+            x0, x1 = max(0, x - r0), min(w, x + r0)
+            patch = img_bgr[y0:y1, x0:x1].reshape(-1, 3).astype(int)
+            mx, mn = patch.max(1), patch.min(1)
+            for px in patch[(mx - mn) > 70][::3]:
+                votes[(px[2] // 32 * 32, px[1] // 32 * 32, px[0] // 32 * 32)] += 1
+        if not votes:
+            return []
+        fill_colour = votes.most_common(1)[0][0]
+    fill_colour = tuple(int(c) for c in fill_colour)  # plain ints (JSON-safe)
+
+    r, g, b = fill_colour
+    mask = cv2.inRange(img_bgr,
+                       np.array([max(b - tol, 0), max(g - tol, 0), max(r - tol, 0)], np.uint8),
+                       np.array([min(b + tol, 255), min(g + tol, 255), min(r + tol, 255)], np.uint8))
+
+    kept = [(int(x), int(y), int(rad)) for x, y, rad in circles
+            if _interior(mask, x, y, rad) > interior_frac_thresh]
+    if not kept:
+        return []
+    # de-duplicate overlapping detections (keep first)
+    coords = np.array([[x, y] for x, y, _ in kept])
+    tree = cKDTree(coords)
+    alive = np.ones(len(kept), dtype=bool)
+    for i in range(len(kept)):
+        if not alive[i]:
+            continue
+        for j in tree.query_ball_point(coords[i], min_dist * 0.8):
+            if j > i:
+                alive[j] = False
+    return [{"x": float(x), "y": float(y), "colour": tuple(fill_colour), "radius": rad}
+            for keep, (x, y, rad) in zip(alive, kept) if keep]
+
+
 def detect_manholes(img_bgr, manhole_colour=None, extra_colours=None, dedup_radius=15):
     """Detect manhole circle symbols, optionally across multiple colours.
 
@@ -774,20 +859,25 @@ def write_polyline_shapefile(lines_geo, out_path_no_ext):
 # ---------------------------------------------------------------------------
 # 5. Orchestration
 # ---------------------------------------------------------------------------
-def digitize_arrays(img_bgr, gcps, *, manhole_colour=None, drain_colour=None,
-                    include_secondary=True, drain_sensitivity=0.6, connect_k=6,
-                    log=None):
+def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=None,
+                    drain_colour=None, include_secondary=True, drain_sensitivity=0.6,
+                    connect_k=6, log=None):
     """Core in-memory pipeline. No file I/O -- used by both the CLI wrapper
     and the Streamlit dashboard.
 
     img_bgr : OpenCV BGR image array.
     gcps    : list of (mapX, mapY, pixel_x, pixel_y) from parse_points_*.
+    manhole_style : "filled" (solid coloured circle/dot symbols -- Wards
+        20/25/31/44) or "outlined" (black-ring circles with marks inside --
+        Ward 52). The two are detected by completely different methods; see
+        detect_manholes / detect_manholes_outlined.
     manhole_colour / drain_colour : optional (R,G,B) MANUAL OVERRIDES. If
-        None, auto_calibrate_colours() picks them. Exposing these is the
-        key robustness lever for "any kind of PNG": when a sheet's colour
-        scheme confuses auto-calibration (e.g. Ward 31's green boundary
-        out-scoring the faint red drain), the user can point the detector
-        at the right colour directly from the dashboard.
+        None, auto_calibrate_colours() picks them (in "filled" mode) or the
+        fill colour is auto-discovered (in "outlined" mode). Exposing these
+        is the key robustness lever for "any kind of PNG": when a sheet's
+        colour scheme confuses auto-calibration (e.g. Ward 31's green
+        boundary out-scoring the faint red drain), the user can point the
+        detector at the right colour directly from the dashboard.
     include_secondary : also hunt for a second manhole population (labelled
         trunk-manhole circles in a different/shared colour).
     drain_sensitivity : fraction of a segment that must be drain-coloured to
@@ -803,24 +893,32 @@ def digitize_arrays(img_bgr, gcps, *, manhole_colour=None, drain_colour=None,
     log(f"image {w}x{h}px | {len(gcps)} GCPs | geo->pixel affine RMSE ~{xf.rmse_px:.1f} px")
 
     calib = auto_calibrate_colours(img_bgr)
-    mh_colour = tuple(manhole_colour) if manhole_colour else calib["manhole_colour"]
     dr_colour = tuple(drain_colour) if drain_colour else calib["drain_colour"]
-    log(f"colours: manhole={mh_colour} drain={dr_colour}"
-        + ("  (manual override)" if manhole_colour or drain_colour else "  (auto)"))
-    if mh_colour is None:
-        raise RuntimeError("Could not determine a manhole colour automatically -- "
-                           "set one manually in the dashboard.")
 
     secondary = []
-    if include_secondary and dr_colour is not None:
-        secondary = find_secondary_manhole_colours(img_bgr, mh_colour, dr_colour)
-        if secondary:
-            log("secondary manhole colour(s): "
-                + ", ".join(f"{s['colour']} (n={s['n']}, on_drain={s['on_drain_frac']*100:.0f}%)"
-                            for s in secondary))
-
-    manholes = detect_manholes(img_bgr, manhole_colour=mh_colour, extra_colours=secondary)
-    log(f"detected {len(manholes)} manhole candidates")
+    if manhole_style == "outlined":
+        # Ward-52 style: black-ring circles with coloured marks inside.
+        mh_colour = tuple(manhole_colour) if manhole_colour else None  # fill colour, or auto
+        manholes = detect_manholes_outlined(img_bgr, fill_colour=mh_colour)
+        if manholes:
+            mh_colour = manholes[0]["colour"]  # the auto-discovered fill colour
+        log(f"outlined-circle mode | fill colour={mh_colour} | drain={dr_colour}")
+        log(f"detected {len(manholes)} manhole circles")
+    else:
+        mh_colour = tuple(manhole_colour) if manhole_colour else calib["manhole_colour"]
+        log(f"colours: manhole={mh_colour} drain={dr_colour}"
+            + ("  (manual override)" if manhole_colour or drain_colour else "  (auto)"))
+        if mh_colour is None:
+            raise RuntimeError("Could not determine a manhole colour automatically -- "
+                               "set one manually, or try 'outlined circle' style.")
+        if include_secondary and dr_colour is not None:
+            secondary = find_secondary_manhole_colours(img_bgr, mh_colour, dr_colour)
+            if secondary:
+                log("secondary manhole colour(s): "
+                    + ", ".join(f"{s['colour']} (n={s['n']}, on_drain={s['on_drain_frac']*100:.0f}%)"
+                                for s in secondary))
+        manholes = detect_manholes(img_bgr, manhole_colour=mh_colour, extra_colours=secondary)
+        log(f"detected {len(manholes)} manhole candidates")
 
     edges = []
     if dr_colour is not None and len(manholes) >= 2:
@@ -836,7 +934,7 @@ def digitize_arrays(img_bgr, gcps, *, manhole_colour=None, drain_colour=None,
         "manholes": manholes, "edges": edges, "transform": xf,
         "manhole_geo": mh_geo, "line_geo": line_geo,
         "manhole_colour": mh_colour, "drain_colour": dr_colour,
-        "secondary": secondary, "calibration": calib,
+        "secondary": secondary, "calibration": calib, "manhole_style": manhole_style,
         "image_size": (w, h), "rmse_px": xf.rmse_px,
     }
 
@@ -889,7 +987,7 @@ def build_shapefile_zip(result, ward_name="ward"):
         return buf.getvalue()
 
 
-def digitize_ward(png_path, points_path, out_dir, ward_name="ward"):
+def digitize_ward(png_path, points_path, out_dir, ward_name="ward", manhole_style="filled"):
     """CLI wrapper: read files, run digitize_arrays, write outputs to disk."""
     os.makedirs(out_dir, exist_ok=True)
     img = cv2.imread(png_path)
@@ -897,7 +995,8 @@ def digitize_ward(png_path, points_path, out_dir, ward_name="ward"):
         raise FileNotFoundError(png_path)
     gcps = parse_points_file(points_path)
 
-    result = digitize_arrays(img, gcps, log=lambda m: print(f"[{ward_name}] {m}"))
+    result = digitize_arrays(img, gcps, manhole_style=manhole_style,
+                             log=lambda m: print(f"[{ward_name}] {m}"))
 
     write_point_shapefile([tuple(g) for g in result["manhole_geo"]], result["manholes"],
                           os.path.join(out_dir, f"Potholes_{ward_name}_AUTO"))
@@ -915,5 +1014,8 @@ if __name__ == "__main__":
     ap.add_argument("points", help="path to matching QGIS .points GCP file")
     ap.add_argument("out_dir", help="output directory for shapefiles")
     ap.add_argument("--ward-name", default="ward", help="label used in output filenames")
+    ap.add_argument("--style", default="filled", choices=["filled", "outlined"],
+                    help="manhole symbol style: 'filled' coloured symbols (default) "
+                         "or 'outlined' black-ring circles with marks inside (e.g. Ward 52)")
     args = ap.parse_args()
-    digitize_ward(args.png, args.points, args.out_dir, args.ward_name)
+    digitize_ward(args.png, args.points, args.out_dir, args.ward_name, manhole_style=args.style)

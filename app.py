@@ -63,13 +63,24 @@ with col_pts:
 ward_name = st.text_input("Output name", value="ward").strip() or "ward"
 
 st.sidebar.header("Detection settings")
+
+style_label = st.sidebar.selectbox(
+    "Manhole symbol style",
+    ["Filled / coloured symbol", "Outlined circle (marks inside)"],
+    help="Most sheets draw manholes as solid coloured circles/dots → use the first. "
+         "If manholes are black-ring circles with +/triangle/hatch marks inside "
+         "(e.g. Ward 52), pick the second.")
+manhole_style = "outlined" if style_label.startswith("Outlined") else "filled"
+
 auto_mode = st.sidebar.toggle("Auto-detect colours", value=True,
                               help="Turn off to pick the manhole / drain colours by hand "
                                    "when a sheet confuses auto-detection.")
 
 manhole_override = drain_override = None
 if not auto_mode:
-    mh_hex = st.sidebar.color_picker("Manhole colour", value="#3f00ff")
+    default_mh = "#00ff00" if manhole_style == "outlined" else "#3f00ff"
+    mh_label = "Fill colour (inside circles)" if manhole_style == "outlined" else "Manhole colour"
+    mh_hex = st.sidebar.color_picker(mh_label, value=default_mh)
     dr_hex = st.sidebar.color_picker("Drain-line colour", value="#ff0000")
     manhole_override = _hex_to_rgb(mh_hex)
     drain_override = _hex_to_rgb(dr_hex)
@@ -108,6 +119,7 @@ if run and png_file and pts_file:
         with st.spinner("Detecting manholes and drainage…"):
             result = wd.digitize_arrays(
                 img, gcps,
+                manhole_style=manhole_style,
                 manhole_colour=manhole_override,
                 drain_colour=drain_override,
                 include_secondary=include_secondary,
@@ -175,8 +187,8 @@ if "result" in st.session_state:
     with st.expander("Run log"):
         st.code("\n".join(st.session_state.get("logs", [])) or "—")
 
-    st.info("Tip: if manholes are missed or the drainage looks sparse, turn off "
-            "**Auto-detect colours** in the sidebar and set the colours by eye from the sheet, "
-            "or lower **Drain sensitivity**.")
+    st.info("Tip: if manholes are missed, over-counted (many dots inside one circle), or the "
+            "drainage looks sparse — try switching **Manhole symbol style** in the sidebar, turn "
+            "off **Auto-detect colours** to set them by eye, or lower **Drain sensitivity**.")
 else:
     st.info("Upload both files and click **Run digitization** to begin.")
