@@ -45,8 +45,10 @@ def _rgb_to_hex(rgb):
     return "#%02x%02x%02x" % tuple(int(c) for c in rgb)
 
 
-@st.cache_data(show_spinner=False)
 def _decode_image(png_bytes):
+    # NOT cached on purpose: caching decoded ~70-megapixel images kept every
+    # uploaded sheet resident in RAM across runs, which pushed the hosted
+    # free tier over its memory limit. Decoding is fast, so just redo it.
     arr = np.frombuffer(png_bytes, np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
 

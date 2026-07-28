@@ -766,10 +766,23 @@ def detect_drainage_edges(img_bgr, nodes, drain_colour=None, k_neighbors=6, samp
     drain_hsv = cv2.cvtColor(np.uint8([[[b, g, r]]]), cv2.COLOR_BGR2HSV)[0, 0]
     if drain_hsv[1] >= 25:  # chromatic drain colour -> hue match (handles tints)
         drain_hue = int(drain_hsv[0])
+        hue_tol, s_floor, v_floor = 12, 25, 40
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-        h = hsv[:, :, 0].astype(int)
-        hue_dist = np.minimum(np.abs(h - drain_hue), 180 - np.abs(h - drain_hue))
-        mask = ((hue_dist <= 12) & (hsv[:, :, 1] >= 25) & (hsv[:, :, 2] >= 40)).astype(np.uint8) * 255
+        # Build the hue-band mask with C-level cv2.inRange calls instead of
+        # big NumPy int arrays (a hsv[:, :, 0].astype(int) on a 70-megapixel
+        # sheet is ~280 MB, and there were several -- a major cause of the
+        # out-of-memory crash on the hosted free tier). inRange keeps it to
+        # a couple of uint8 masks. Two calls cover the hue wraparound at 0.
+        lo, hi = drain_hue - hue_tol, drain_hue + hue_tol
+        mask = cv2.inRange(hsv, np.array([max(lo, 0), s_floor, v_floor], np.uint8),
+                                np.array([min(hi, 179), 255, 255], np.uint8))
+        if lo < 0:
+            mask |= cv2.inRange(hsv, np.array([180 + lo, s_floor, v_floor], np.uint8),
+                                     np.array([179, 255, 255], np.uint8))
+        if hi > 179:
+            mask |= cv2.inRange(hsv, np.array([0, s_floor, v_floor], np.uint8),
+                                     np.array([hi - 180, 255, 255], np.uint8))
+        del hsv
     else:  # achromatic (grey/near-black) drain -> fall back to RGB box
         lower = np.array([max(b - tol, 0), max(g - tol, 0), max(r - tol, 0)], dtype=np.uint8)
         upper = np.array([min(b + tol, 255), min(g + tol, 255), min(r + tol, 255)], dtype=np.uint8)
@@ -884,8 +897,15 @@ def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=Non
         accept a drainage edge (lower = more edges, more permissive).
     connect_k : each manhole is tested against its k nearest neighbours.
 
+    Runs at full image resolution (downscaling was tried and rejected: it
+    destabilises the Hough circle detector and breaks colour auto-calibration
+    on ~70-megapixel sheets). Memory is instead kept down by freeing
+    transients between stages and by using C-level OpenCV ops rather than
+    large NumPy temporaries -- see detect_drainage_edges.
+
     Returns a dict with everything the dashboard needs to render + export.
     """
+    import gc
     log = log or (lambda *_a, **_k: None)
     h, w = img_bgr.shape[:2]
 
@@ -893,6 +913,7 @@ def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=Non
     log(f"image {w}x{h}px | {len(gcps)} GCPs | geo->pixel affine RMSE ~{xf.rmse_px:.1f} px")
 
     calib = auto_calibrate_colours(img_bgr)
+    gc.collect()  # free calibration's transient masks/label arrays before detection
     dr_colour = tuple(drain_colour) if drain_colour else calib["drain_colour"]
 
     secondary = []
@@ -919,12 +940,14 @@ def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=Non
                                 for s in secondary))
         manholes = detect_manholes(img_bgr, manhole_colour=mh_colour, extra_colours=secondary)
         log(f"detected {len(manholes)} manhole candidates")
+    gc.collect()  # free detection transients before drainage
 
     edges = []
     if dr_colour is not None and len(manholes) >= 2:
         edges = detect_drainage_edges(img_bgr, manholes, drain_colour=dr_colour,
                                       k_neighbors=connect_k, red_frac_thresh=drain_sensitivity)
     log(f"reconstructed {len(edges)} drainage edges")
+    gc.collect()
 
     mh_px = np.array([[m["x"], m["y"]] for m in manholes], dtype=float)
     mh_geo = xf.pixel_to_geo_batch(mh_px) if len(manholes) else np.zeros((0, 2))
@@ -941,27 +964,34 @@ def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=Non
 
 def render_overlay(img_bgr, result, max_width=1600):
     """Return an RGB overlay image (numpy array) with drainage lines and
-    manhole markers drawn on the source sheet, downscaled for display."""
-    vis = img_bgr.copy()
+    manhole markers drawn on the source sheet, downscaled for display.
 
-    # drainage edges (blue), drawn from stored pixel node coords
+    The image is downscaled FIRST and markers drawn on the small copy, so we
+    never allocate a full-resolution copy of a ~70-megapixel sheet (that
+    doubling was a big contributor to the out-of-memory crash on the hosted
+    free tier). Stored coordinates are full-resolution, so they're scaled by
+    the same factor when drawn.
+    """
+    scale = min(1.0, max_width / img_bgr.shape[1])
+    if scale < 1.0:
+        vis = cv2.resize(img_bgr, (max(1, int(img_bgr.shape[1] * scale)),
+                                   max(1, int(img_bgr.shape[0] * scale))),
+                         interpolation=cv2.INTER_AREA)
+    else:
+        vis = img_bgr.copy()
+
+    def sc(m):
+        return (int(m["x"] * scale), int(m["y"] * scale))
+
     mh = result["manholes"]
-    for i, j in result["edges"]:
-        p1 = (int(mh[i]["x"]), int(mh[i]["y"]))
-        p2 = (int(mh[j]["x"]), int(mh[j]["y"]))
-        cv2.line(vis, p1, p2, (255, 0, 0), 3)  # BGR blue
-    # manholes: primary as green dot, secondary/labelled as magenta ring
+    for i, j in result["edges"]:  # drainage edges (blue)
+        cv2.line(vis, sc(mh[i]), sc(mh[j]), (255, 0, 0), 2)
     primary = result["manhole_colour"]
-    for m in mh:
-        c = (int(m["x"]), int(m["y"]))
+    for m in mh:  # manholes: green dot; labelled/2nd colour as magenta ring
         if tuple(m.get("colour", primary)) == tuple(primary):
-            cv2.circle(vis, c, 5, (0, 200, 0), 2)      # green
+            cv2.circle(vis, sc(m), 4, (0, 200, 0), 2)
         else:
-            cv2.circle(vis, c, 12, (255, 0, 255), 3)   # magenta ring for labelled circles
-
-    if vis.shape[1] > max_width:
-        scale = max_width / vis.shape[1]
-        vis = cv2.resize(vis, (int(vis.shape[1] * scale), int(vis.shape[0] * scale)))
+            cv2.circle(vis, sc(m), 9, (255, 0, 255), 2)
     return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
 
 
