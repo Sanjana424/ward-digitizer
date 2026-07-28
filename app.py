@@ -81,8 +81,11 @@ auto_mode = st.sidebar.toggle("Auto-detect colours", value=True,
 manhole_override = drain_override = None
 if not auto_mode:
     default_mh = "#00ff00" if manhole_style == "outlined" else "#3f00ff"
-    mh_label = "Fill colour (inside circles)" if manhole_style == "outlined" else "Manhole colour"
-    mh_hex = st.sidebar.color_picker(mh_label, value=default_mh)
+    mh_label = "Circle colour (outline or fill)" if manhole_style == "outlined" else "Manhole colour"
+    mh_help = ("The colour that defines the circle: the ring/outline colour "
+               "(e.g. Ward 8 cyan) or the interior fill colour (e.g. Ward 52 green). "
+               "Set this if auto-detection picks the wrong one.") if manhole_style == "outlined" else None
+    mh_hex = st.sidebar.color_picker(mh_label, value=default_mh, help=mh_help)
     dr_hex = st.sidebar.color_picker("Drain-line colour", value="#ff0000")
     manhole_override = _hex_to_rgb(mh_hex)
     drain_override = _hex_to_rgb(dr_hex)

@@ -591,89 +591,95 @@ def _detect_blobs(img_bgr, rgb_colour, tol=30, max_aspect=None,
     return out, mask
 
 
-def detect_manholes_outlined(img_bgr, fill_colour=None, min_radius=None, max_radius=None,
-                             param2=26, interior_frac_thresh=0.06, tol=60):
-    """Detect manholes drawn as BLACK-OUTLINE CIRCLES with a coloured fill /
-    marks inside (Ward 52 style), rather than as solid coloured symbols.
-
-    Why a whole separate detector: on Ward 52 the manhole is a black ring
-    with a bright-green hatch (small circles) or green +/triangle/dot marks
-    (large labelled circles) inside it. The colour-blob detector latches
-    onto the *interior marks* and drops one point per mark -- so a big
-    circle with 5 marks became 5 points. Here we instead find the ring
-    itself with a Hough circle transform (one detection per circle,
-    whatever is inside), then keep only circles that actually contain the
-    fill colour -- which removes text loops ('O', 'D', 'RCPC') and other
-    round shapes that have nothing coloured inside.
-
-    fill_colour : (R,G,B) of the interior fill. If None, it's auto-detected
-        as the most common saturated colour found inside the candidate
-        circles -- so this is not hard-coded to green and adapts per sheet.
-    Radii and spacing default to a fraction of the sheet size, so the two
-    circle sizes on a sheet are both caught at any resolution.
-    """
-    from collections import Counter
-    from scipy.spatial import cKDTree
-
-    h, w = img_bgr.shape[:2]
-    scale = max(h, w) / 10000.0
-    if min_radius is None:
-        min_radius = max(5, int(round(9 * scale)))
-    if max_radius is None:
-        max_radius = max(min_radius + 6, int(round(45 * scale)))
-    min_dist = max(10, int(round(20 * scale)))
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    circles = cv2.HoughCircles(cv2.medianBlur(gray, 3), cv2.HOUGH_GRADIENT, dp=1,
-                               minDist=min_dist, param1=100, param2=param2,
-                               minRadius=min_radius, maxRadius=max_radius)
-    if circles is None:
-        return []
-    circles = np.round(circles[0]).astype(int)
-
-    def _interior(mask, x, y, rad, f=0.8):
-        r0 = max(2, int(rad * f))
-        y0, y1 = max(0, y - r0), min(mask.shape[0], y + r0)
-        x0, x1 = max(0, x - r0), min(mask.shape[1], x + r0)
-        p = mask[y0:y1, x0:x1]
-        return (p.mean() / 255) if p.size else 0.0
-
-    if fill_colour is None:  # auto-discover the interior fill colour
-        votes = Counter()
-        for x, y, rad in circles:
-            r0 = max(2, int(rad * 0.6))
-            y0, y1 = max(0, y - r0), min(h, y + r0)
-            x0, x1 = max(0, x - r0), min(w, x + r0)
-            patch = img_bgr[y0:y1, x0:x1].reshape(-1, 3).astype(int)
-            mx, mn = patch.max(1), patch.min(1)
-            for px in patch[(mx - mn) > 70][::3]:
-                votes[(px[2] // 32 * 32, px[1] // 32 * 32, px[0] // 32 * 32)] += 1
-        if not votes:
-            return []
-        fill_colour = votes.most_common(1)[0][0]
-    fill_colour = tuple(int(c) for c in fill_colour)  # plain ints (JSON-safe)
-
-    r, g, b = fill_colour
+def _circle_contours(img_bgr, rgb, close_k, fill_thresh, rmin, rmax, tol=38):
+    """Find round blobs of one colour: colour-threshold, close (so a ring
+    outline or a hatch/marks fill becomes a solid disk), then keep contours
+    that are circular (minEnclosingCircle fill), the right size, and not
+    axis-aligned squares (rejects G.P gully-pit squares). Returns
+    [(x, y, radius, area), ...]. Memory-light -- no Hough accumulator."""
+    r, g, b = rgb
     mask = cv2.inRange(img_bgr,
                        np.array([max(b - tol, 0), max(g - tol, 0), max(r - tol, 0)], np.uint8),
                        np.array([min(b + tol, 255), min(g + tol, 255), min(r + tol, 255)], np.uint8))
-
-    kept = [(int(x), int(y), int(rad)) for x, y, rad in circles
-            if _interior(mask, x, y, rad) > interior_frac_thresh]
-    if not kept:
-        return []
-    # de-duplicate overlapping detections (keep first)
-    coords = np.array([[x, y] for x, y, _ in kept])
-    tree = cKDTree(coords)
-    alive = np.ones(len(kept), dtype=bool)
-    for i in range(len(kept)):
-        if not alive[i]:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 40:
             continue
-        for j in tree.query_ball_point(coords[i], min_dist * 0.8):
-            if j > i:
-                alive[j] = False
-    return [{"x": float(x), "y": float(y), "colour": tuple(fill_colour), "radius": rad}
-            for keep, (x, y, rad) in zip(alive, kept) if keep]
+        (x, y), rad = cv2.minEnclosingCircle(c)
+        if not (rmin <= rad <= rmax):
+            continue
+        if area / (np.pi * rad * rad + 1e-6) < fill_thresh:   # round (rejects lines/arrows/text strokes)
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if area / (bw * bh + 1e-6) > 0.88:                    # fills its box -> square (G.P), reject
+            continue
+        out.append((float(x), float(y), float(rad), float(area)))
+    return out
+
+
+def detect_manholes_outlined(img_bgr, fill_colour=None, close_k=None,
+                             fill_thresh=0.5, rmin=5, rmax=45):
+    """Detect manholes drawn as CIRCLES (an outline plus marks inside),
+    rather than as solid coloured symbols. Two real examples:
+      * Ward 52 -- black-ring circles with a bright-green hatch or green
+        +/triangle marks inside (two sizes).
+      * Ward 8 -- cyan-ring circles with a red star or green triangle
+        inside, plus green-dashed drains.
+
+    Why not the colour-blob detector: it would drop one point on each mark
+    inside a circle (a big circle with 5 marks became 5 points).
+
+    Method (memory-light, replaces an earlier Hough version that used
+    ~2.2 GB on a 70-megapixel sheet and crashed the hosted free tier): find
+    the circle's defining colour, close it into a solid disk, and take one
+    contour centroid per disk. This runs in well under 1 GB.
+
+    fill_colour : (R,G,B) of the circle's defining colour -- the outline
+        colour (Ward 8 cyan) or the interior fill colour (Ward 52 green).
+        If None it is auto-picked as the colour that yields the most
+        uniformly-sized round blobs. Auto-pick can choose the interior mark
+        colour over the outline on sheets where both are strong (Ward 8
+        red stars vs cyan rings); the dashboard's manual colour override
+        exists for exactly that case.
+    """
+    h, w = img_bgr.shape[:2]
+    if close_k is None:  # scale the closing kernel to sheet resolution
+        close_k = max(3, int(round(9 * max(h, w) / 10000)) | 1)
+
+    def circles_for(rgb):
+        return _circle_contours(img_bgr, rgb, close_k, fill_thresh, rmin, rmax)
+
+    if fill_colour is None:  # auto-pick colour: most, and most uniform, round blobs
+        small = img_bgr[::3, ::3].reshape(-1, 3).astype(int)
+        mx, mn = small.max(1), small.min(1)
+        sat = small[(mx - mn) > 80]
+        if len(sat) == 0:
+            return []
+        uniq, counts = np.unique(sat // 24 * 24, axis=0, return_counts=True)
+        cands = [tuple(int(v) for v in uniq[i][::-1]) for i in np.argsort(-counts)[:8]]  # RGB
+        best, best_score = None, -1.0
+        for col in cands:
+            pts = circles_for(col)
+            if len(pts) < 10:
+                continue
+            areas = np.array([p[3] for p in pts])
+            cv = areas.std() / (areas.mean() + 1e-6)
+            score = len(pts) / (cv + 0.15)  # many + uniform size
+            if score > best_score:
+                best_score, best, best_pts = score, col, pts
+        if best is None:
+            return []
+        fill_colour, pts = best, best_pts
+    else:
+        fill_colour = tuple(int(c) for c in fill_colour)
+        pts = circles_for(fill_colour)
+
+    return [{"x": x, "y": y, "colour": tuple(int(c) for c in fill_colour), "radius": int(round(rad))}
+            for (x, y, rad, _area) in pts]
 
 
 def detect_manholes(img_bgr, manhole_colour=None, extra_colours=None, dedup_radius=15):
