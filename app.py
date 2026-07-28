@@ -111,7 +111,9 @@ if run and png_file and pts_file:
         st.stop()
 
     try:
-        gcps = wd.parse_points_text(pts_file.getvalue().decode("utf-8", errors="replace"))
+        pts_text = pts_file.getvalue().decode("utf-8", errors="replace")
+        gcps = wd.parse_points_text(pts_text)
+        crs_wkt = wd.parse_points_crs(pts_text)  # write the output .prj in the GCPs' own CRS
     except Exception as e:  # noqa: BLE001
         st.error(f"Could not parse the .points file: {e}")
         st.stop()
@@ -130,6 +132,7 @@ if run and png_file and pts_file:
                 include_secondary=include_secondary,
                 drain_sensitivity=drain_sensitivity,
                 connect_k=connect_k,
+                crs_wkt=crs_wkt,
                 log=logs.append,
             )
     except Exception as e:  # noqa: BLE001

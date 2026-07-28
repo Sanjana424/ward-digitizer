@@ -97,6 +97,24 @@ def parse_points_text(text):
     return gcps
 
 
+def parse_points_crs(text):
+    """Extract the CRS WKT from the '#CRS: ...' header line of a .points file.
+
+    CRITICAL: the .points mapX/mapY are in whatever CRS this header names,
+    which is NOT always EPSG:4326. Ward 8's GCPs are EPSG:3857 (Web
+    Mercator, metres, values ~9.8e6) while Wards 44/25/etc. are EPSG:4326
+    (lon/lat degrees, ~88/22). The output coordinates come straight from
+    these GCPs, so the .prj we write MUST match this CRS -- otherwise QGIS
+    reads metres as degrees and the points land off the earth (which looked
+    like "no potholes in the download"). Returns the WKT string, or None."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.upper().startswith("#CRS:"):
+            wkt = s[s.index(":") + 1:].strip()
+            return wkt or None
+    return None
+
+
 class GeoTransform:
     """Pixel<->geo transform fit with Thin Plate Spline (TPS) interpolation.
 
@@ -735,6 +753,53 @@ def detect_manholes(img_bgr, manhole_colour=None, extra_colours=None, dedup_radi
 # ---------------------------------------------------------------------------
 # 3. Drainage network reconstruction (graph-snapping)
 # ---------------------------------------------------------------------------
+def detect_drain_colour(img_bgr, nodes, manhole_colour=None, k=4, samples=5):
+    """Find the drain-line colour by sampling what runs BETWEEN adjacent
+    manholes, rather than by shape statistics of the whole sheet.
+
+    This is far more robust than the shape-based guess in
+    auto_calibrate_colours, which mis-picked on Ward 8 (it chose the cyan
+    flow-arrows over the green-dashed drains, giving zero drainage). Because
+    a drain run by definition connects neighbouring manholes, the colour
+    that most often appears on the short segment between a manhole and its
+    nearest neighbours IS the drain colour. Validated to return the correct
+    colour on every test ward: red (44/20/52), purple (25), green (8).
+
+    Returns an (R,G,B) tuple, or None.
+    """
+    from collections import Counter
+    from scipy.spatial import cKDTree
+
+    if len(nodes) < 3:
+        return None
+    pts = np.array([[n["x"], n["y"]] for n in nodes])
+    max_d = 0.06 * max(img_bgr.shape[:2])
+    tree = cKDTree(pts)
+    _, nbr = tree.query(pts, k=min(k + 1, len(pts)))
+    H, W = img_bgr.shape[:2]
+    mh = np.array(manhole_colour) if manhole_colour else None
+    votes = Counter()
+    for i, ns in enumerate(nbr):
+        for j in ns[1:]:
+            d = np.linalg.norm(pts[i] - pts[j])
+            if d > max_d or d < 5:
+                continue
+            for t in np.linspace(0.3, 0.7, samples):  # mid-segment, skips the circles
+                x, y = (pts[i] * (1 - t) + pts[j] * t).astype(int)
+                if not (0 <= y < H and 0 <= x < W):
+                    continue
+                patch = img_bgr[max(0, y - 2):y + 2, max(0, x - 2):x + 2].reshape(-1, 3).astype(int)
+                mx, mn = patch.max(1), patch.min(1)
+                for px in patch[(mx - mn) > 60]:
+                    rgb = (int(px[2]), int(px[1]), int(px[0]))
+                    if mh is not None and np.abs(np.array(rgb) - mh).sum() < 60:
+                        continue  # skip the manhole's own colour
+                    votes[(rgb[0] // 24 * 24, rgb[1] // 24 * 24, rgb[2] // 24 * 24)] += 1
+    if not votes:
+        return None
+    return tuple(int(c) for c in votes.most_common(1)[0][0])
+
+
 def detect_drainage_edges(img_bgr, nodes, drain_colour=None, k_neighbors=6, sample_n=40,
                            red_frac_thresh=0.6, tol=35):
     """Connect manhole nodes that have a red-dashed line running between them.
@@ -845,34 +910,38 @@ def detect_drainage_edges(img_bgr, nodes, drain_colour=None, k_neighbors=6, samp
 
 
 # ---------------------------------------------------------------------------
-# 4. Shapefile writers (EPSG:4326)
+# 4. Shapefile writers -- CRS taken from the .points header, not hard-coded
 # ---------------------------------------------------------------------------
-def _write_prj(out_path_no_ext):
-    wgs84_wkt = (
-        'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],'
-        'PRIMEM["Greenwich",0],UNIT["Degree",0.017453292519943295]]'
-    )
+_WGS84_WKT = (
+    'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],'
+    'PRIMEM["Greenwich",0],UNIT["Degree",0.017453292519943295]]'
+)
+
+
+def _write_prj(out_path_no_ext, crs_wkt=None):
+    # Write the CRS that the GCPs (and therefore the output coordinates) are
+    # actually in. Defaults to WGS84 only when the .points file gave no CRS.
     with open(out_path_no_ext + ".prj", "w") as f:
-        f.write(wgs84_wkt)
+        f.write(crs_wkt or _WGS84_WKT)
 
 
-def write_point_shapefile(points_geo, attrs_list, out_path_no_ext):
+def write_point_shapefile(points_geo, attrs_list, out_path_no_ext, crs_wkt=None):
     with shapefile.Writer(out_path_no_ext, shapeType=shapefile.POINT) as w:
         w.field("id", "N")
         w.field("type", "C")
-        for i, ((lon, lat), a) in enumerate(zip(points_geo, attrs_list)):
-            w.point(lon, lat)
+        for i, ((x, y), a) in enumerate(zip(points_geo, attrs_list)):
+            w.point(x, y)
             w.record(i, a.get("type") or str(a.get("colour", "")))
-    _write_prj(out_path_no_ext)
+    _write_prj(out_path_no_ext, crs_wkt)
 
 
-def write_polyline_shapefile(lines_geo, out_path_no_ext):
+def write_polyline_shapefile(lines_geo, out_path_no_ext, crs_wkt=None):
     with shapefile.Writer(out_path_no_ext, shapeType=shapefile.POLYLINE) as w:
         w.field("id", "N")
         for i, line in enumerate(lines_geo):
             w.line([line])
             w.record(i)
-    _write_prj(out_path_no_ext)
+    _write_prj(out_path_no_ext, crs_wkt)
 
 
 # ---------------------------------------------------------------------------
@@ -880,7 +949,7 @@ def write_polyline_shapefile(lines_geo, out_path_no_ext):
 # ---------------------------------------------------------------------------
 def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=None,
                     drain_colour=None, include_secondary=True, drain_sensitivity=0.6,
-                    connect_k=6, log=None):
+                    connect_k=6, crs_wkt=None, log=None):
     """Core in-memory pipeline. No file I/O -- used by both the CLI wrapper
     and the Streamlit dashboard.
 
@@ -948,6 +1017,18 @@ def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=Non
         log(f"detected {len(manholes)} manhole candidates")
     gc.collect()  # free detection transients before drainage
 
+    # Refine the drain colour by sampling what actually runs between manholes
+    # (unless the user set it manually). More robust than the shape-based
+    # guess -- it's what fixed Ward 8, whose green-dashed drains the
+    # shape method missed in favour of the cyan flow-arrows.
+    if drain_colour is None and len(manholes) >= 3:
+        guided = detect_drain_colour(img_bgr, manholes, mh_colour)
+        if guided is not None:
+            if guided != dr_colour:
+                log(f"drain colour from manhole spacing: {guided} (was {dr_colour})")
+            dr_colour = guided
+    gc.collect()
+
     edges = []
     if dr_colour is not None and len(manholes) >= 2:
         edges = detect_drainage_edges(img_bgr, manholes, drain_colour=dr_colour,
@@ -964,7 +1045,7 @@ def digitize_arrays(img_bgr, gcps, *, manhole_style="filled", manhole_colour=Non
         "manhole_geo": mh_geo, "line_geo": line_geo,
         "manhole_colour": mh_colour, "drain_colour": dr_colour,
         "secondary": secondary, "calibration": calib, "manhole_style": manhole_style,
-        "image_size": (w, h), "rmse_px": xf.rmse_px,
+        "image_size": (w, h), "rmse_px": xf.rmse_px, "crs_wkt": crs_wkt,
     }
 
 
@@ -1007,12 +1088,13 @@ def build_shapefile_zip(result, ward_name="ward"):
     import tempfile
     import zipfile
 
+    crs_wkt = result.get("crs_wkt")
     with tempfile.TemporaryDirectory() as tmp:
         pot = os.path.join(tmp, f"Potholes_{ward_name}")
         dra = os.path.join(tmp, f"Drainage_{ward_name}")
         write_point_shapefile([tuple(g) for g in result["manhole_geo"]],
-                              result["manholes"], pot)
-        write_polyline_shapefile(result["line_geo"], dra)
+                              result["manholes"], pot, crs_wkt=crs_wkt)
+        write_polyline_shapefile(result["line_geo"], dra, crs_wkt=crs_wkt)
         with open(os.path.join(tmp, f"manholes_{ward_name}_pixels.json"), "w") as f:
             json.dump(result["manholes"], f, indent=2)
 
@@ -1029,15 +1111,17 @@ def digitize_ward(png_path, points_path, out_dir, ward_name="ward", manhole_styl
     img = cv2.imread(png_path)
     if img is None:
         raise FileNotFoundError(png_path)
-    gcps = parse_points_file(points_path)
+    points_text = open(points_path, encoding="utf-8").read()
+    gcps = parse_points_text(points_text)
+    crs_wkt = parse_points_crs(points_text)
 
-    result = digitize_arrays(img, gcps, manhole_style=manhole_style,
+    result = digitize_arrays(img, gcps, manhole_style=manhole_style, crs_wkt=crs_wkt,
                              log=lambda m: print(f"[{ward_name}] {m}"))
 
     write_point_shapefile([tuple(g) for g in result["manhole_geo"]], result["manholes"],
-                          os.path.join(out_dir, f"Potholes_{ward_name}_AUTO"))
+                          os.path.join(out_dir, f"Potholes_{ward_name}_AUTO"), crs_wkt=crs_wkt)
     write_polyline_shapefile(result["line_geo"],
-                             os.path.join(out_dir, f"Drainage_{ward_name}_AUTO"))
+                             os.path.join(out_dir, f"Drainage_{ward_name}_AUTO"), crs_wkt=crs_wkt)
     with open(os.path.join(out_dir, f"manholes_{ward_name}_pixels.json"), "w") as f:
         json.dump(result["manholes"], f, indent=2)
     print(f"[{ward_name}] wrote shapefiles + pixel JSON to {out_dir}")
